@@ -32,21 +32,17 @@ const IS_WINDOWS = process.platform === 'win32';
 function getProcessList() {
   try {
     if (IS_WINDOWS) {
-      // Use PowerShell Get-Process (WMIC is deprecated in Windows 10/11)
-      const output = execFileSync('powershell', ['-Command', 'Get-Process | Select-Object Id, Path, CommandLine | ConvertTo-Csv -NoTypeInformation'], {
-        encoding: 'utf-8',
-        maxBuffer: 10 * 1024 * 1024,
-      });
-      // Parse CSV: skip header
-      const lines = output.split('\n').slice(1);
-      return lines.map(line => {
-        const parts = line.split(',');
-        if (parts.length < 3) return null;
-        const pid = parts[0].trim().replace(/^"|"$/g, '');
-        const commandLine = parts[2].trim().replace(/^"|"$/g, '');
-        if (!pid || !commandLine) return null;
-        return { commandLine, pid };
-      }).filter(Boolean);
+      // Win32_Process via CIM (Get-Process has no CommandLine property)
+      const output = execFileSync('powershell.exe', ['-NoProfile', '-Command',
+        '@(Get-CimInstance Win32_Process | Where-Object { $_.CommandLine } | Select-Object ProcessId, CommandLine) | ConvertTo-Json -Compress'],
+        { encoding: 'utf-8', maxBuffer: 32 * 1024 * 1024 });
+      let procs;
+      try { procs = JSON.parse(output); } catch { return []; }
+      if (!procs) return [];
+      if (!Array.isArray(procs)) procs = [procs];
+      return procs
+        .filter((p) => p && p.ProcessId && p.CommandLine)
+        .map((p) => ({ pid: String(p.ProcessId), commandLine: String(p.CommandLine) }));
     } else {
       // ps aux on Unix-like systems
       const output = execSync('ps aux', { encoding: 'utf-8', maxBuffer: 10 * 1024 * 1024 });
@@ -64,20 +60,14 @@ function getProcessList() {
 function getListeningPorts(pid) {
   try {
     if (IS_WINDOWS) {
-      // Use PowerShell to get netstat output and filter by PID
-      const output = execFileSync('powershell', ['-Command', `netstat -ano | Select-String "${pid}$"`], {
-        encoding: 'utf-8',
-        maxBuffer: 10 * 1024 * 1024,
-      });
+      const output = execSync('netstat -ano', { encoding: 'utf-8', maxBuffer: 32 * 1024 * 1024 });
       const ports = [];
-      for (const line of output.split('\n')) {
-        // Match: 127.0.0.1:PORT ... LISTENING PID
-        // Check if line ends with the PID we're looking for
-        if (!line.trim().endsWith(pid)) continue;
-        const match = line.match(/127\.0\.0\.1:(\d+).*LISTENING/);
-        if (match) {
-          ports.push(parseInt(match[1]));
-        }
+      const re = /127\.0\.0\.1:(\d+)\s+\S+\s+LISTENING\s+(\d+)/g;
+      let match;
+      while ((match = re.exec(output)) !== null) {
+        if (match[2] !== String(pid)) continue;
+        const port = parseInt(match[1], 10);
+        if (port && !ports.includes(port)) ports.push(port);
       }
       return ports;
     } else {

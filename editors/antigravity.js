@@ -8,7 +8,10 @@ const { getAppDataPath } = require('./base');
 const HOME = os.homedir();
 const ANTIGRAVITY_USER_DIR = path.join(getAppDataPath('Antigravity'), 'User');
 const ANTIGRAVITY_GLOBAL_STORAGE_DB = path.join(ANTIGRAVITY_USER_DIR, 'globalStorage', 'state.vscdb');
-const ANTIGRAVITY_BRAIN_DIR = path.join(HOME, '.gemini', 'antigravity', 'brain');
+const ANTIGRAVITY_LOCAL_DIR = path.join(HOME, '.gemini', 'antigravity');
+const ANTIGRAVITY_SUMMARIES_DB = path.join(ANTIGRAVITY_LOCAL_DIR, 'conversation_summaries.db');
+const ANTIGRAVITY_CONVERSATIONS_DIR = path.join(ANTIGRAVITY_LOCAL_DIR, 'conversations');
+const ANTIGRAVITY_BRAIN_DIR = path.join(ANTIGRAVITY_LOCAL_DIR, 'brain');
 const OFFLINE_TRAJECTORY_SUMMARIES_KEYS = [
   'antigravityUnifiedStateSync.trajectorySummaries',
   'unifiedStateSync.trajectorySummaries',
@@ -137,6 +140,82 @@ function skipField(buf, offset, wireType) {
     return end <= buf.length ? { offset: end } : null;
   }
   return null;
+}
+
+// ============================================================
+// Generic protobuf wire-format decoder (decode-on-demand).
+// decodeProtoTree(buf) → { [fieldNumber]: [rawValue, ...] }
+// where rawValue is a Number (varint fields) or Buffer (length-
+// delimited / fixed fields). Use getF/getSub/getText helpers to
+// walk the tree; nested messages are decoded lazily so that
+// string fields are never lost to spurious nested parsing.
+// ============================================================
+
+function decodeProtoTree(buf) {
+  const out = {};
+  let offset = 0;
+  while (offset < buf.length) {
+    const tagRes = readVarint(buf, offset);
+    if (!tagRes) return null;
+    offset = tagRes.offset;
+
+    const fieldNumber = Math.floor(tagRes.value / 8);
+    const wireType = tagRes.value & 0x7;
+    if (fieldNumber === 0) return null;
+
+    if (wireType === 0) {
+      const valueRes = readVarint(buf, offset);
+      if (!valueRes) return null;
+      offset = valueRes.offset;
+      (out[fieldNumber] = out[fieldNumber] || []).push(valueRes.value);
+    } else if (wireType === 1) {
+      if (offset + 8 > buf.length) return null;
+      (out[fieldNumber] = out[fieldNumber] || []).push(buf.subarray(offset, offset + 8));
+      offset += 8;
+    } else if (wireType === 2) {
+      const ld = readLengthDelimited(buf, offset);
+      if (!ld) return null;
+      offset = ld.offset;
+      (out[fieldNumber] = out[fieldNumber] || []).push(ld.bytes);
+    } else if (wireType === 5) {
+      if (offset + 4 > buf.length) return null;
+      (out[fieldNumber] = out[fieldNumber] || []).push(buf.subarray(offset, offset + 4));
+      offset += 4;
+    } else {
+      return null;
+    }
+  }
+  return out;
+}
+
+// First raw value of field n (Number or Buffer)
+function getF(node, n) {
+  if (!node || !node[n] || node[n].length === 0) return null;
+  return node[n][0];
+}
+
+// First nested message of field n (decoded lazily)
+function getSub(node, n) {
+  const v = getF(node, n);
+  if (!v || !Buffer.isBuffer(v)) return null;
+  return decodeProtoTree(v);
+}
+
+// First value of field n as strict-UTF-8 text (null if binary)
+function getText(node, n) {
+  const v = getF(node, n);
+  if (typeof v === 'number') return String(v);
+  if (!v || !Buffer.isBuffer(v)) return null;
+  return bytesToUtf8(v);
+}
+
+function protoTimestamp(node) {
+  // {1: seconds, 2: nanos} → epoch ms
+  if (!node) return null;
+  const sec = getF(node, 1);
+  if (typeof sec !== 'number' || sec < 946684800 || sec > 4102444800) return null;
+  const nanos = getF(node, 2);
+  return Math.round(sec * 1000 + (typeof nanos === 'number' ? nanos / 1e6 : 0));
 }
 
 function* iterAllUtf8StringsInProto(buf, maxDepth, depth = 0) {
@@ -409,7 +488,71 @@ function buildOfflineMetaMapFromGlobalStateTrajectorySummariesValue(outerValueBa
   return chats;
 }
 
+// ============================================================
+// Offline source: ~/.gemini/antigravity/conversation_summaries.db
+// (works when Antigravity is closed; covers all platforms)
+// ============================================================
+
+function parseSqliteDatetime(s) {
+  // "2026-11-15 11:53:19.8712335+00:00" → epoch ms
+  if (!s || typeof s !== 'string') return null;
+  const iso = s.replace(' ', 'T').replace(/(\.\d{3})\d+/, '$1');
+  const t = Date.parse(iso);
+  return Number.isNaN(t) ? null : t;
+}
+
+function workspaceUrisToFolder(json) {
+  try {
+    const uris = JSON.parse(json);
+    if (!Array.isArray(uris)) return null;
+    for (const uri of uris) {
+      if (typeof uri !== 'string') continue;
+      const folder = fileUriToPath(uri);
+      if (folder) return folder;
+    }
+  } catch { /* ignore */ }
+  return null;
+}
+
+function getLocalSummariesChats() {
+  if (!fs.existsSync(ANTIGRAVITY_SUMMARIES_DB)) return [];
+
+  let db = null;
+  try {
+    db = new Database(ANTIGRAVITY_SUMMARIES_DB, { readonly: true, fileMustExist: true });
+    const rows = db.prepare(
+      'SELECT conversation_id, title, step_count, last_modified_time, workspace_uris, agent_name, last_user_input_time FROM conversation_summaries'
+    ).all();
+
+    return rows.map((r) => ({
+      source: 'antigravity',
+      composerId: r.conversation_id,
+      name: (r.title || '').trim() || null,
+      createdAt: parseSqliteDatetime(r.last_user_input_time) || parseSqliteDatetime(r.last_modified_time),
+      lastUpdatedAt: parseSqliteDatetime(r.last_modified_time),
+      mode: r.agent_name || 'cascade',
+      folder: workspaceUrisToFolder(r.workspace_uris),
+      encrypted: false,
+      bubbleCount: r.step_count || 0,
+      _stepCount: r.step_count || 0,
+      _type: 'antigravity-offline-local',
+      _offline: true,
+      _dbPath: ANTIGRAVITY_SUMMARIES_DB,
+      _rawSource: 'offline-local-db',
+    })).filter((c) => c.composerId);
+  } catch {
+    return [];
+  } finally {
+    if (db) db.close();
+  }
+}
+
 function getOfflineChats() {
+  // Primary: new Antigravity local storage (~/.gemini/antigravity)
+  const local = getLocalSummariesChats();
+  if (local.length > 0) return local;
+
+  // Legacy fallback: VS Code-style globalStorage state.vscdb
   for (const key of OFFLINE_TRAJECTORY_SUMMARIES_KEYS) {
     const value = readGlobalStateValue(key);
     if (!value) continue;
@@ -427,6 +570,7 @@ function getOfflineChats() {
       bubbleCount: meta.bubbleCount || 0,
       _stepCount: meta.bubbleCount || 0,
       _type: 'antigravity-offline',
+      _offline: true,
       _dbPath: ANTIGRAVITY_GLOBAL_STORAGE_DB,
       _rawSource: 'offline-global-state',
     }));
@@ -437,6 +581,195 @@ function getOfflineChats() {
   }
 
   return [];
+}
+
+// ============================================================
+// Offline messages: ~/.gemini/antigravity/conversations/<id>.db
+// Step payloads are raw protobuf (CortexStep). Known step types:
+//   14  = user input        (text at field 19.2 / 19.3.1)
+//   15  = agent turn        (prose at 20.1, tool output at 20.3/20.7.3,
+//                            token usage at 5.9.{1,2,3,5})
+//   132 = planner response  (tool calls at 5.4.[{1:id,2:name,3:args}],
+//                            model uid at 5.11)
+//   others (memory/knowledge/browser snapshots) are skipped
+// ============================================================
+
+const STEP_TYPE_USER_INPUT = 14;
+const STEP_TYPE_AGENT_TURN = 15;
+const STEP_TYPE_PLANNER_RESPONSE = 132;
+
+function attachUsageToLastAssistant(messages, usage) {
+  for (let i = messages.length - 1; i >= 0; i--) {
+    if (messages[i].role === 'assistant') {
+      messages[i]._inputTokens = (messages[i]._inputTokens || 0) + (usage.input || 0);
+      messages[i]._outputTokens = (messages[i]._outputTokens || 0) + (usage.output || 0);
+      messages[i]._cacheRead = (messages[i]._cacheRead || 0) + (usage.cacheRead || 0);
+      return;
+    }
+    if (messages[i].role === 'user') return;
+  }
+}
+
+function parseOfflineStep(top, messages) {
+  const type = getF(top, 1);
+  if (typeof type !== 'number') return null;
+
+  if (type === STEP_TYPE_USER_INPUT) {
+    const userInput = getSub(top, 19);
+    if (!userInput) return null;
+    let text = getText(userInput, 2);
+    if (!text) {
+      const nested = getSub(userInput, 3);
+      text = nested ? getText(nested, 1) : null;
+    }
+    if (!text || !text.trim()) return null;
+    return { role: 'user', content: text };
+  }
+
+  if (type === STEP_TYPE_PLANNER_RESPONSE) {
+    const meta = getSub(top, 5);
+    if (!meta) return null;
+
+    const toolCalls = [];
+    for (const raw of (meta[4] || [])) {
+      if (!Buffer.isBuffer(raw)) continue;
+      const tc = decodeProtoTree(raw);
+      if (!tc) continue;
+      const id = getText(tc, 1);
+      const tcName = getText(tc, 2);
+      const argsJson = getText(tc, 3);
+      if (!tcName) continue;
+      let args = {};
+      try { args = argsJson ? JSON.parse(argsJson) : {}; } catch { args = {}; }
+      toolCalls.push({ name: tcName, args, _id: id });
+    }
+
+    const modelUid = getF(meta, 11);
+    const parts = toolCalls.map((tc) => {
+      const argKeys = typeof tc.args === 'object' ? Object.keys(tc.args).join(', ') : '';
+      return `[tool-call: ${tc.name}(${argKeys})]`;
+    });
+
+    if (parts.length === 0) return null;
+
+    return {
+      role: 'assistant',
+      content: parts.join('\n'),
+      _model: typeof modelUid === 'number' ? normalizeModel(String(modelUid)) : null,
+      _toolCalls: toolCalls,
+    };
+  }
+
+  if (type === STEP_TYPE_AGENT_TURN) {
+    const meta = getSub(top, 5);
+    const turn = getSub(top, 20);
+    if (!turn) return null;
+
+    // Build the message first (prose response or tool execution result)
+    // Prose response to the user (field 20.1 / 20.8)
+    let prose = getText(turn, 1);
+    if (!prose || !prose.trim()) prose = getText(turn, 8);
+
+    let msg = null;
+    if (prose && prose.trim()) {
+      const modelUid = meta ? getF(meta, 11) : null;
+      msg = {
+        role: 'assistant',
+        content: prose.trim(),
+        _model: typeof modelUid === 'number' ? normalizeModel(String(modelUid)) : null,
+      };
+    } else {
+      // Tool execution result (field 20.3 = text, 20.7 = {1: callId, 3: resultJson})
+      let output = getText(turn, 3);
+      let toolName = null;
+      if (!output || !output.trim()) {
+        const toolResult = getSub(turn, 7);
+        if (toolResult) {
+          const resultJson = getText(toolResult, 3);
+          const callId = getText(toolResult, 1);
+          if (resultJson) {
+            toolName = extractToolNameFromCallId(messages, callId);
+            output = resultJson;
+          }
+        }
+      }
+      if (output && output.trim()) {
+        const preview = output.substring(0, 500);
+        msg = { role: 'tool', content: toolName ? `[${toolName}] ${preview}` : `[tool] ${preview}` };
+      }
+    }
+
+    // Token usage lives at 5.9.{1: input, 2: output, 3: reasoning, 5: total}
+    if (meta) {
+      const usageNode = getSub(meta, 9);
+      if (usageNode) {
+        const input = getF(usageNode, 1);
+        const output = getF(usageNode, 2);
+        const reasoning = getF(usageNode, 3);
+        const total = getF(usageNode, 5);
+        const inputN = typeof input === 'number' ? input : 0;
+        const outputN = typeof output === 'number' ? output : 0;
+        const reasoningN = typeof reasoning === 'number' ? reasoning : 0;
+        const totalN = typeof total === 'number' ? total : 0;
+        const cacheRead = Math.max(0, totalN - inputN - outputN - reasoningN);
+        if (inputN || outputN || cacheRead) {
+          const usage = { input: inputN, output: outputN + reasoningN, cacheRead };
+          if (msg && msg.role === 'assistant') {
+            // This step IS the generation its usage belongs to
+            msg._inputTokens = usage.input;
+            msg._outputTokens = usage.output;
+            msg._cacheRead = usage.cacheRead;
+          } else {
+            // Tool execution step: usage belongs to the previous planner generation
+            attachUsageToLastAssistant(messages, usage);
+          }
+        }
+      }
+    }
+
+    return msg;
+  }
+
+  return null;
+}
+
+function extractToolNameFromCallId(messages, callId) {
+  if (!callId) return null;
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const m = messages[i];
+    if (m.role !== 'assistant' || !m._toolCalls) continue;
+    for (const tc of m._toolCalls) {
+      if (tc._id === callId) return tc.name;
+    }
+  }
+  return null;
+}
+
+function getOfflineMessages(chat) {
+  const dbPath = path.join(ANTIGRAVITY_CONVERSATIONS_DIR, `${chat.composerId}.db`);
+  if (!fs.existsSync(dbPath)) return [];
+
+  let db = null;
+  try {
+    db = new Database(dbPath, { readonly: true, fileMustExist: true });
+    const rows = db.prepare('SELECT step_payload FROM steps ORDER BY idx').all();
+    const messages = [];
+    for (const row of rows) {
+      const payload = row.step_payload;
+      if (!payload || !Buffer.isBuffer(payload) || payload.length === 0) continue;
+      try {
+        const top = decodeProtoTree(payload);
+        if (!top) continue;
+        const msg = parseOfflineStep(top, messages);
+        if (msg) messages.push(msg);
+      } catch { /* skip malformed step */ }
+    }
+    return messages;
+  } catch {
+    return [];
+  } finally {
+    if (db) db.close();
+  }
 }
 
 function mergeChats(liveChats, offlineChats) {
@@ -481,21 +814,17 @@ const IS_WINDOWS = process.platform === 'win32';
 function getProcessList() {
   try {
     if (IS_WINDOWS) {
-      // Use PowerShell Get-Process (WMIC is deprecated in Windows 10/11)
-      const output = execFileSync('powershell', ['-Command', 'Get-Process | Select-Object Id, Path, CommandLine | ConvertTo-Csv -NoTypeInformation'], {
-        encoding: 'utf-8',
-        maxBuffer: 10 * 1024 * 1024,
-      });
-      // Parse CSV: skip header
-      const lines = output.split('\n').slice(1);
-      return lines.map(line => {
-        const parts = line.split(',');
-        if (parts.length < 3) return null;
-        const pid = parts[0].trim().replace(/^"|"$/g, '');
-        const commandLine = parts[2].trim().replace(/^"|"$/g, '');
-        if (!pid || !commandLine) return null;
-        return { commandLine, pid };
-      }).filter(Boolean);
+      // Win32_Process via CIM (Get-Process has no CommandLine property)
+      const output = execFileSync('powershell.exe', ['-NoProfile', '-Command',
+        '@(Get-CimInstance Win32_Process | Where-Object { $_.CommandLine } | Select-Object ProcessId, CommandLine) | ConvertTo-Json -Compress'],
+        { encoding: 'utf-8', maxBuffer: 32 * 1024 * 1024 });
+      let procs;
+      try { procs = JSON.parse(output); } catch { return []; }
+      if (!procs) return [];
+      if (!Array.isArray(procs)) procs = [procs];
+      return procs
+        .filter((p) => p && p.ProcessId && p.CommandLine)
+        .map((p) => ({ pid: String(p.ProcessId), commandLine: String(p.CommandLine) }));
     } else {
       const output = execSync('ps aux', { encoding: 'utf-8', maxBuffer: 10 * 1024 * 1024 });
       return output.split('\n').slice(1).map(line => {
@@ -511,35 +840,22 @@ function getProcessList() {
 
 function getListeningPorts(pid) {
   try {
-    if (IS_WINDOWS) {
-      // Use PowerShell to get netstat output and filter by PID
-      const output = execFileSync('powershell', ['-Command', `netstat -ano | Select-String "${pid}$"`], {
-        encoding: 'utf-8',
-        maxBuffer: 10 * 1024 * 1024,
-      });
-      const ports = [];
-      for (const line of output.split('\n')) {
-        if (!line.trim().endsWith(pid)) continue;
-        const match = line.match(/127\.0\.0\.1:(\d+).*LISTENING/);
-        if (match) {
-          ports.push(parseInt(match[1]));
-        }
-      }
-      return ports;
-    } else {
-      const output = execSync(`lsof -i TCP -P -n -a -p ${pid} 2>/dev/null`, {
-        encoding: 'utf-8',
-        maxBuffer: 10 * 1024 * 1024,
-      });
-      const ports = [];
-      for (const line of output.split('\n')) {
-        const match = line.match(/TCP\s+127\.0\.0\.1:(\d+)\s+\(LISTEN\)/);
-        if (match) {
-          ports.push(parseInt(match[1]));
-        }
-      }
-      return ports;
+    const output = IS_WINDOWS
+      ? execSync('netstat -ano', { encoding: 'utf-8', maxBuffer: 32 * 1024 * 1024 })
+      : execSync(`lsof -i TCP -P -n -a -p ${pid} 2>/dev/null`, { encoding: 'utf-8', maxBuffer: 10 * 1024 * 1024 });
+
+    const ports = [];
+    const re = IS_WINDOWS
+      ? /127\.0\.0\.1:(\d+)\s+\S+\s+LISTENING\s+(\d+)/g
+      : /TCP\s+127\.0\.0\.1:(\d+)\s+\(LISTEN\)/g;
+
+    let match;
+    while ((match = re.exec(output)) !== null) {
+      if (IS_WINDOWS && match[2] !== String(pid)) continue;
+      const port = parseInt(match[1], 10);
+      if (port && !ports.includes(port)) ports.push(port);
     }
+    return ports;
   } catch { return []; }
 }
 
@@ -553,35 +869,37 @@ let _lsCacheCheckedAt = 0;
 function findLanguageServer() {
   if (_lsCache !== null && (Date.now() - _lsCacheCheckedAt) < 10000) return _lsCache || null;
 
-  const serverProcessName = IS_WINDOWS
-    ? 'language_server_windows'
-    : process.platform === 'darwin'
-      ? 'language_server_macos'
-      : 'language_server_linux';
-
   for (const proc of getProcessList()) {
     const { commandLine, pid } = proc;
-    if (!commandLine.includes(serverProcessName)) continue;
+    // Match language_server(.exe) / language_server_windows / _macos / _linux
+    if (!/language_server(\.exe|_windows|_macos|_linux)?(\s|"|$)/i.test(commandLine)) continue;
+    // Must be Antigravity's server (ide name override or app data dir)
+    if (!/antigravity/i.test(commandLine)) continue;
 
-    const appDirMatch = commandLine.match(/--app_data_dir\s+(\S+)/);
-    if (!appDirMatch || !appDirMatch[1].includes('antigravity')) continue;
-
-    const csrfMatch = commandLine.match(/--csrf_token\s+(\S+)/);
+    const csrfMatch = commandLine.match(/--csrf_token[=\s]+(\S+)/);
     if (!csrfMatch) continue;
 
-    const serverPortMatch = commandLine.match(/--server_port\s+(\d+)/);
     const ports = getListeningPorts(pid);
     if (ports.length === 0) continue;
 
-    let port;
-    if (serverPortMatch) {
-      port = parseInt(serverPortMatch[1], 10);
-      if (!ports.includes(port)) port = Math.min(...ports);
-    } else {
-      port = Math.min(...ports);
+    // Antigravity's LS listens on one HTTPS port (self-signed) and one
+    // HTTP port. Explicit flags win when present.
+    const httpsPortMatch = commandLine.match(/--https_server_port[=\s]+(\d+)/);
+    const serverPortMatch = commandLine.match(/--server_port[=\s]+(\d+)/);
+
+    let candidates = [];
+    if (httpsPortMatch && parseInt(httpsPortMatch[1], 10) > 0) {
+      candidates.push({ port: parseInt(httpsPortMatch[1], 10), scheme: 'https' });
+    }
+    if (serverPortMatch && parseInt(serverPortMatch[1], 10) > 0) {
+      candidates.push({ port: parseInt(serverPortMatch[1], 10), scheme: 'http' });
+    }
+    for (const port of ports) {
+      candidates.push({ port, scheme: 'https' });
+      candidates.push({ port, scheme: 'http' });
     }
 
-    _lsCache = { port, csrf: csrfMatch[1], pid };
+    _lsCache = { csrf: csrfMatch[1], pid, candidates };
     _lsCacheCheckedAt = Date.now();
     return _lsCache;
   }
@@ -592,27 +910,54 @@ function findLanguageServer() {
 }
 
 // ============================================================
-// Connect protocol HTTP client (always HTTPS, always main CSRF)
+// Connect protocol HTTP client (tries HTTPS then HTTP per port)
 // ============================================================
+
+let _rpcEndpoint = null; // { port, scheme } once discovered
+
+function writeTempBody(data) {
+  const os = require('os');
+  const file = path.join(os.tmpdir(), `agentlytics-antigravity-${process.pid}-${Date.now()}.json`);
+  fs.writeFileSync(file, data);
+  return file;
+}
 
 function callRpc(method, body) {
   const ls = findLanguageServer();
   if (!ls) return null;
 
   const data = JSON.stringify(body || {});
-  const url = `https://127.0.0.1:${ls.port}/exa.language_server_pb.LanguageServerService/${method}`;
 
-  try {
-    const result = execSync(
-      `curl -s -k -X POST ${JSON.stringify(url)} ` +
-      `-H "Content-Type: application/json" ` +
-      `-H "x-codeium-csrf-token: ${ls.csrf}" ` +
-      `-d ${JSON.stringify(data)} ` +
-      `--max-time 10`,
-      { encoding: 'utf-8', maxBuffer: 50 * 1024 * 1024, stdio: ['pipe', 'pipe', 'pipe'] }
-    );
-    return JSON.parse(result);
-  } catch { return null; }
+  // Endpoint already probed: single attempt
+  const attempts = _rpcEndpoint
+    ? [_rpcEndpoint, ...ls.candidates.filter((c) => c.port !== _rpcEndpoint.port)]
+    : ls.candidates;
+
+  for (const cand of attempts) {
+    const url = `${cand.scheme}://127.0.0.1:${cand.port}/exa.language_server_pb.LanguageServerService/${method}`;
+    let bodyFile = null;
+    try {
+      bodyFile = writeTempBody(data);
+      const insecureFlag = cand.scheme === 'https' ? ' -k' : '';
+      const result = execSync(
+        `curl -s${insecureFlag} --max-time 10 -X POST ${JSON.stringify(url)} ` +
+        `-H "Content-Type: application/json" ` +
+        `-H "x-codeium-csrf-token: ${ls.csrf}" ` +
+        `-d @${JSON.stringify(bodyFile)}`,
+        { encoding: 'utf-8', maxBuffer: 50 * 1024 * 1024, stdio: ['pipe', 'pipe', 'pipe'] }
+      );
+      if (!result || !result.trim()) continue;
+      const parsed = JSON.parse(result);
+      _rpcEndpoint = { port: cand.port, scheme: cand.scheme };
+      return parsed;
+    } catch {
+      continue;
+    } finally {
+      if (bodyFile) { try { fs.unlinkSync(bodyFile); } catch { /* ignore */ } }
+    }
+  }
+
+  return null;
 }
 
 // ============================================================
@@ -819,8 +1164,8 @@ function parseStep(step) {
 
   if (type === 'CORTEX_STEP_TYPE_MCP_TOOL' && step.mcpTool) {
     const mt = step.mcpTool;
-    const name = mt.toolName || mt.name || 'mcp_tool';
-    return { role: 'tool', content: `[${name}]` };
+    const mname = mt.toolName || mt.name || 'mcp_tool';
+    return { role: 'tool', content: `[${mname}]` };
   }
 
   // Skip non-content steps
@@ -834,7 +1179,19 @@ function parseStep(step) {
 }
 
 function getMessages(chat) {
+  // Offline chats: parse local SQLite step payloads
+  if (chat._offline) {
+    const offlineMessages = getOfflineMessages(chat);
+    if (offlineMessages.length > 0) return offlineMessages;
+  }
+
   const steps = getSteps(chat);
+  if (steps.length === 0 && !chat._offline) {
+    // Live lookup returned nothing — fall back to the local DB
+    const offlineMessages = getOfflineMessages(chat);
+    if (offlineMessages.length > 0) return offlineMessages;
+  }
+
   const messages = [];
   for (const step of steps) {
     const msg = parseStep(step);
@@ -929,7 +1286,7 @@ function getUsage() {
   };
 }
 
-function resetCache() { _lsCache = null; _lsCacheCheckedAt = 0; _modelMap = null; _sessionFolderMap = null; }
+function resetCache() { _lsCache = null; _lsCacheCheckedAt = 0; _modelMap = null; _sessionFolderMap = null; _rpcEndpoint = null; }
 
 const labels = { 'antigravity': 'Antigravity' };
 
@@ -1011,8 +1368,10 @@ function getMCPServers() {
   const { parseMcpConfigFile } = require('./base');
   // Antigravity uses similar config to Windsurf: ~/.codeium/antigravity/mcp_config.json
   const globalConfig = path.join(HOME, '.codeium', 'antigravity', 'mcp_config.json');
+  const geminiConfig = path.join(ANTIGRAVITY_LOCAL_DIR, 'mcp_config.json');
   return [
     ...parseMcpConfigFile(globalConfig, { editor: 'antigravity', label: 'Antigravity', scope: 'global' }),
+    ...parseMcpConfigFile(geminiConfig, { editor: 'antigravity', label: 'Antigravity', scope: 'global' }),
   ];
 }
 
